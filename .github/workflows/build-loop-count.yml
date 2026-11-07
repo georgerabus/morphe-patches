@@ -1,0 +1,167 @@
+name: Build Morphe Patches with Loop count
+
+on:
+  schedule:
+    # Every Monday at 05:00 UTC.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish a new bundle even if Morphe Patches and Loop count did not change
+        type: boolean
+        default: false
+
+permissions:
+  # Creates the release and pushes patches-bundle.json.
+  contents: write
+  # Downloads the Morphe patcher from GitHub Packages.
+  packages: read
+  # Keeps the schedule on, see the last step.
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  UPSTREAM_REPOSITORY: MorpheApp/morphe-patches
+  # The stable releases of Morphe Patches.
+  UPSTREAM_BRANCH: main
+  # The Loop count commits, added on top of Morphe Patches.
+  PATCH_BRANCH: feat/loop-count
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bundle branch
+        uses: actions/checkout@v7
+        with:
+          path: bundle
+
+      - name: Checkout Morphe Patches
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          path: source
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Add Loop count
+        id: source
+        working-directory: source
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          upstream_commit=$(git rev-parse HEAD)
+          git fetch --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "${PATCH_BRANCH}"
+          loop_count_commit=$(git rev-parse FETCH_HEAD)
+
+          # Only the commits that Morphe Patches does not have are added.
+          # If they conflict with a new version of Morphe Patches, the workflow fails here.
+          git checkout --quiet -B build FETCH_HEAD
+          git rebase "${upstream_commit}"
+          git log --oneline -3
+
+          upstream_version=$(sed -n 's/^version *= *//p' gradle.properties)
+          version="${upstream_version}-loopcount.${GITHUB_RUN_NUMBER}"
+
+          changed=true
+          if [ -f ../bundle/patches-bundle.json ] && [ "${FORCE}" != "true" ]; then
+            previous=$(jq -r '"\(.upstream_commit) \(.loop_count_commit)"' ../bundle/patches-bundle.json)
+            if [ "${previous}" = "${upstream_commit} ${loop_count_commit}" ]; then
+              changed=false
+              echo "Morphe Patches and Loop count did not change, nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          {
+            echo "changed=${changed}"
+            echo "upstream_commit=${upstream_commit}"
+            echo "loop_count_commit=${loop_count_commit}"
+            echo "upstream_version=${upstream_version}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java
+        if: steps.source.outputs.changed == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Build
+        if: steps.source.outputs.changed == 'true'
+        working-directory: source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          sed -i "s/^version *=.*/version = ${VERSION}/" gradle.properties
+          ./gradlew :patches:buildAndroid --no-daemon
+          ls -l "patches/build/libs/patches-${VERSION}.mpp"
+
+      - name: Publish
+        if: steps.source.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.source.outputs.version }}
+          UPSTREAM_VERSION: ${{ steps.source.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ steps.source.outputs.upstream_commit }}
+          LOOP_COUNT_COMMIT: ${{ steps.source.outputs.loop_count_commit }}
+        run: |
+          tag="v${VERSION}"
+          file="patches-${VERSION}.mpp"
+
+          notes="Morphe Patches ${UPSTREAM_VERSION} with the Loop count patch.
+
+          - Morphe Patches: https://github.com/${UPSTREAM_REPOSITORY}/commit/${UPSTREAM_COMMIT}
+          - Loop count: https://github.com/${GITHUB_REPOSITORY}/commit/${LOOP_COUNT_COMMIT}"
+          notes=$(printf '%s\n' "${notes}" | sed 's/^ *//')
+
+          # The release comes first, so patches-bundle.json never points to a file that is not uploaded yet.
+          gh release create "${tag}" "source/patches/build/libs/${file}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_REF_NAME}" \
+            --title "Morphe Patches ${UPSTREAM_VERSION} + Loop count" \
+            --notes "${notes}"
+
+          # The changes of Morphe Patches, which the release notes of the Morphe Manager show.
+          upstream_description=$(jq -r '.description // ""' source/patches-bundle.json)
+          cp source/CHANGELOG.md bundle/CHANGELOG.md
+
+          # No public_key: the bundle is not signed, and Morphe Manager only accepts it without a key.
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+            --arg description "$(printf '%s\n\n%s' "${notes}" "${upstream_description}")" \
+            --arg download_url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${file}" \
+            --arg page_url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" \
+            --arg upstream_commit "${UPSTREAM_COMMIT}" \
+            --arg loop_count_commit "${LOOP_COUNT_COMMIT}" \
+            '{version: $version, created_at: $created_at, description: $description,
+              download_url: $download_url, page_url: $page_url,
+              upstream_commit: $upstream_commit, loop_count_commit: $loop_count_commit}' \
+            > bundle/patches-bundle.json
+
+          cd bundle
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add patches-bundle.json CHANGELOG.md
+          git commit -m "chore: Release ${VERSION}"
+          git push
+
+          echo "Published [${tag}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag})." >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub turns off a schedule after 60 days without activity in the repository.
+      # Turning the workflow on again resets that time, also when nothing was published.
+      - name: Keep the schedule on
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build-loop-count.yml/enable"
